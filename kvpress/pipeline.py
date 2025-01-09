@@ -1,30 +1,14 @@
-# SPDX-FileCopyrightText: Copyright (c) 1993-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: Apache-2.0
-
-
-import contextlib
-import logging
-from typing import Optional
-
-import torch
-from transformers import AutoModelForCausalLM, Cache, DynamicCache, Pipeline
-from transformers.pipelines import PIPELINE_REGISTRY
-from transformers.pipelines.base import GenericTensor
-
-from kvpress.presses.base_press import BasePress
-from kvpress.presses.key_rerotation_press import KeyRerotationPress
-from kvpress.presses.observed_attention_press import ObservedAttentionPress
-from kvpress.presses.per_layer_compression_press import PerLayerCompressionPress
-
-logger = logging.getLogger(__name__)
-
-
-class KVPressTextGenerationPipeline(Pipeline):
+class KVPressMultiTurnPipeline(Pipeline):
     """
-    Pipeline for key-value compression in causal language models.
-    This pipeline allows you to compress a long prompt using a key-value press
-    and then generate answers using greedy decoding.
+    Pipeline for multi-turn conversations with key-value compression in causal language models.
+    Supports both single-turn and multi-turn scenarios.
     """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.conversation_history = []
+        self.total_sequence_length = 0
+        self.persistent_cache = None
 
     def _sanitize_parameters(
         self,
@@ -35,52 +19,31 @@ class KVPressTextGenerationPipeline(Pipeline):
         max_new_tokens: int = 50,
         max_context_length: Optional[int] = None,
         cache: Optional[Cache] = None,
+        is_continuation: bool = False,
         **kwargs,
     ):
         """
         Sanitize the input parameters for the pipeline.
-        The user can either provide a single question or a list of questions to be asked about the context.
-
-        Parameters
-        ----------
-        question : str, optional
-            The question to be asked about the context. Exclusive with `questions`.
-        questions : list[str], optional
-            A list of questions to be asked about the context. Exclusive with `question`.
-        answer_prefix : str, optional
-            The prefix to be added to the generated answer.
-        press : BasePress, optional
-            The key-value press to use for compression.
-        max_new_tokens : int, optional
-            The maximum number of new tokens to generate for each answer.
-        max_context_length : int, optional
-            The maximum number of tokens in the context. By default will use the maximum length supported by the model.
-        cache : Cache, optional
-            The cache to use for the forward pass. Defaults to None (DynamicCache).
-        **kwargs : dict
-            Additional keyword arguments, currently ignored.
-
-        Returns
-        -------
-        Tuple[dict, dict, dict]
-            A tuple containing three dictionaries:
-                - preprocess_kwargs: The keyword arguments for the preprocess function.
-                - forward_kwargs: The keyword arguments for the forward function.
-                - postprocess_kwargs: The keyword arguments for the postprocess function.
+        Extended version of the original sanitization that adds multi-turn support.
         """
-
         answer_prefix = answer_prefix or ""
         postprocess_kwargs = {"single_question": questions is None}
         assert question is None or questions is None, "Either question or questions should be provided, not both."
         questions = questions or ([question] if question else [""])
         if max_context_length is None:
-            max_context_length = min(self.tokenizer.model_max_length, int(1e10))  # 1e10 to avoid overflow
+            max_context_length = min(self.tokenizer.model_max_length, int(1e10))
+            
         preprocess_kwargs = {
             "questions": questions,
             "answer_prefix": answer_prefix,
             "max_context_length": max_context_length,
         }
-        forward_kwargs = {"press": press, "max_new_tokens": max_new_tokens, "cache": cache}
+        forward_kwargs = {
+            "press": press, 
+            "max_new_tokens": max_new_tokens, 
+            "cache": cache,
+            "is_continuation": is_continuation  # Added parameter for multi-turn
+        }
         return preprocess_kwargs, forward_kwargs, postprocess_kwargs
 
     def preprocess(
@@ -91,38 +54,34 @@ class KVPressTextGenerationPipeline(Pipeline):
         max_context_length: int,
     ):
         """
-        Apply the chat template to the triplet (context, questions, answer_prefix) and tokenize it.
-
-        Returns
-        -------
-        dict[str, GenericTensor]
-            A dictionary containing the tokenized context (key: "context_ids") and questions (key: "questions_ids").
-
+        Apply the chat template to the context and questions, handling conversation history.
         """
+        # Handle conversation history if it exists
+        if self.conversation_history:
+            context = "\n".join(self.conversation_history + [context])
 
-        # Apply chat template if available
+        # Original chat template handling
         if self.tokenizer.chat_template is None:
             bos_token = getattr(self.tokenizer, "bos_token", "")
             context = bos_token + context
-            question_suffix = "\n"  # to separate the question from the answer
+            question_suffix = "\n"
         else:
             separator = "\n" + "#" * len(context)
             context = self.tokenizer.apply_chat_template(
-                [{"role": "user", "content": context + separator}], add_generation_prompt=True, tokenize=False
+                [{"role": "user", "content": context + separator}], 
+                add_generation_prompt=True, 
+                tokenize=False
             )
             context, question_suffix = context.split(separator)
 
-        # Add question_suffix and answer prefix
-        # e.g. for llama3.1, question_suffix="<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n")
         questions = [question + question_suffix + answer_prefix for question in questions]
 
-        # Tokenize the context and questions
         context_ids = self.tokenizer.encode(context, return_tensors="pt", add_special_tokens=False)
         question_ids = [
-            self.tokenizer.encode(question, return_tensors="pt", add_special_tokens=False) for question in questions
+            self.tokenizer.encode(question, return_tensors="pt", add_special_tokens=False) 
+            for question in questions
         ]
 
-        # Truncate context
         if context_ids.shape[1] > max_context_length:
             logger.warning(
                 f"Context length has been truncated from {context_ids.shape[1]} to {max_context_length} tokens."
@@ -137,59 +96,46 @@ class KVPressTextGenerationPipeline(Pipeline):
         max_new_tokens: int = 50,
         press: Optional[BasePress] = None,
         cache: Optional[Cache] = None,
+        is_continuation: bool = False,
     ):
         """
-        Forward pass of the kv-press pipeline.
-
-        Parameters
-        ----------
-        input_tensors : dict[str, GenericTensor]
-            A dictionary containing the tokenized context and questions.
-        max_new_tokens : int, optional
-            The maximum number of new tokens to generate for each answer. Defaults to 50.
-        press : BasePress, optional
-            The key-value press to use for compression. Defaults to None.
-        cache : Cache, optional
-            The cache to use for the forward pass. Defaults to None (DynamicCache).
-
-        Returns
-        -------
-        list[str]
-            A list of generated answers.
+        Forward pass handling both single-turn and multi-turn scenarios.
         """
+        # Use persistent cache for continuation, or initialize new one
+        if is_continuation and self.persistent_cache is not None:
+            cache = self.persistent_cache
+        else:
+            self.persistent_cache = DynamicCache() if cache is None else cache
+            cache = self.persistent_cache
 
         context_ids = input_tensors["context_ids"].to(self.model.device)
-        context_length = context_ids.shape[1]
+        
+        # Process context only for new conversations or empty cache
+        if not is_continuation or cache.get_seq_length() == 0:
+            with press(self.model) if press is not None else contextlib.nullcontext():
+                self.model(
+                    input_ids=context_ids,
+                    past_key_values=cache,
+                    output_attentions=self.output_attentions(press),
+                    num_logits_to_keep=1,
+                )
+            self.total_sequence_length = cache.get_seq_length()
 
-        # Prefilling using the press on the context
-        if cache is None:
-            cache = DynamicCache()
-
-        with press(self.model) if press is not None else contextlib.nullcontext():
-            self.model(
-                input_ids=context_ids,
-                past_key_values=cache,
-                output_attentions=self.output_attentions(press),
-                num_logits_to_keep=1,
-            )
-
-        logger.debug(f"Context Length: {context_length}")
-        logger.debug(f"Compressed Context Length: {cache.get_seq_length()}")
-
-        # Greedy decoding for each question
         answers = []
         for question_ids in input_tensors["questions_ids"]:
             answer = self.generate_answer(
                 question_ids=question_ids.to(self.model.device),
                 cache=cache,
-                context_length=(cache.get_seq_length() if isinstance(press, KeyRerotationPress) else context_length),
+                context_length=self.total_sequence_length,
                 max_new_tokens=max_new_tokens,
             )
             answers.append(answer)
+            self.conversation_history.append(answer)
 
         return answers
 
     def output_attentions(self, press: BasePress):
+        """Maintained from original implementation"""
         if isinstance(press, ObservedAttentionPress):
             return True
         if isinstance(press, (KeyRerotationPress, PerLayerCompressionPress)) and isinstance(
@@ -198,47 +144,34 @@ class KVPressTextGenerationPipeline(Pipeline):
             return True
         return False
 
-    def postprocess(self, model_outputs, single_question):
-        if single_question:
-            return {"answer": model_outputs[0]}
-        return {"answers": model_outputs}
-
     def generate_answer(
-        self, question_ids: torch.Tensor, cache: Cache, context_length: int, max_new_tokens: int
+        self, 
+        question_ids: torch.Tensor, 
+        cache: Cache, 
+        context_length: int, 
+        max_new_tokens: int
     ) -> str:
         """
-        Generate an answer to a question using greedy decoding.
-
-        Parameters
-        ----------
-        question_ids : torch.Tensor
-            The tokenized question.
-        cache : Cache
-            The compressed key-value cache.
-        context_length : int
-            The length of the context.
-        max_new_tokens : int
-            The maximum number of new tokens to generate.
-
-        Returns
-        -------
-        str
-            The generated answer.
+        Generate an answer, handling position IDs for multi-turn conversations.
         """
-
         cache_seq_lengths = [cache.get_seq_length(layer_idx) for layer_idx in range(len(cache))]
+        
         position_ids = torch.arange(
-            context_length, context_length + question_ids.shape[1], device=self.model.device
+            self.total_sequence_length,
+            self.total_sequence_length + question_ids.shape[1],
+            device=self.model.device
         ).unsqueeze(0)
 
-        # if the user doesn't provide a question, skip forward pass
         outputs = self.model(
-            input_ids=question_ids.to(self.model.device),
+            input_ids=question_ids,
             past_key_values=cache,
             position_ids=position_ids,
             num_logits_to_keep=1,
         )
 
+        self.total_sequence_length += question_ids.shape[1]
+        
+        # Original generation logic maintained
         position_ids = position_ids[:, -1:] + 1
         generated_ids = [outputs.logits[0, -1].argmax()]
 
@@ -256,32 +189,17 @@ class KVPressTextGenerationPipeline(Pipeline):
             generated_ids.append(new_id)
             if new_id.item() in should_stop_token_ids:
                 break
-        answer = self.tokenizer.decode(torch.stack(generated_ids), skip_special_tokens=True)
 
-        # Remove the generated tokens from the cache
-        cache.key_cache = [
-            cache.key_cache[layer_idx][:, :, :sequence_length]
-            for layer_idx, sequence_length in enumerate(cache_seq_lengths)
-        ]
-        cache.value_cache = [
-            cache.value_cache[layer_idx][:, :, :sequence_length]
-            for layer_idx, sequence_length in enumerate(cache_seq_lengths)
-        ]
-        if hasattr(cache, "_quantized_key_cache"):
-            cache._quantized_key_cache = [
-                cache._quantized_key_cache[layer_idx][:, :, :sequence_length]
-                for layer_idx, sequence_length in enumerate(cache_seq_lengths)
-            ]
-            cache._quantized_value_cache = [
-                cache._quantized_value_cache[layer_idx][:, :, :sequence_length]
-                for layer_idx, sequence_length in enumerate(cache_seq_lengths)
-            ]
+        return self.tokenizer.decode(torch.stack(generated_ids), skip_special_tokens=True)
 
-        return answer
+    def reset_conversation(self):
+        """Reset the conversation state"""
+        self.conversation_history = []
+        self.total_sequence_length = 0
+        self.persistent_cache = None
 
-
-PIPELINE_REGISTRY.register_pipeline(
-    "kv-press-text-generation",
-    pipeline_class=KVPressTextGenerationPipeline,
-    pt_model=AutoModelForCausalLM,
-)
+    def postprocess(self, model_outputs, single_question):
+        """Maintained from original implementation"""
+        if single_question:
+            return {"answer": model_outputs[0]}
+        return {"answers": model_outputs}
